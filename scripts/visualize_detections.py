@@ -57,6 +57,9 @@ if __name__ == '__main__':
         # find most recent image
         image_index = step_index_to_image_index[step]
         image = extract_image_by_index(dsec_directory.images.image_files_distorted, image_index)
+        # Detections are in event-camera coords (640x480). Resize RGB to match if it's the full-res camera image.
+        if image.shape[:2] != (480, 640):
+            image = cv2.resize(image, (640, 480))
 
         # find events within time window [image_timestamps, t]
         events = extract_from_h5_by_timewindow(dsec_directory.events.event_file, t-args.event_time_window_us, t)
@@ -74,7 +77,8 @@ if __name__ == '__main__':
                                      boxes["class_id"], boxes['class_confidence'], conf=0.3, nms=0.65)
 
         if args.write_to_output:
-            cv2.imwrite(str(output_path / ("%06d.png" % step)), image)
+            image_big = cv2.resize(image, (1280, 960), interpolation=cv2.INTER_LINEAR)
+            cv2.imwrite(str(output_path / ("%06d.png" % step)), image_big)
         else:
             cv2.imshow("DSEC Det: Visualization", image)
             cv2.waitKey(3)

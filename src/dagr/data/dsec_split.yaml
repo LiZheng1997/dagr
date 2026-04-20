@@ -54,6 +54,8 @@ test:
   - interlaken_00_a
   - interlaken_00_b
   - interlaken_01_a
+  - zurich_city_00_a
+  - zurich_city_03_a
   - zurich_city_12_a
   - zurich_city_13_a
   - zurich_city_13_b

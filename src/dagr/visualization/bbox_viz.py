@@ -8,7 +8,7 @@ _COLORS = np.array([[0.000, 0.8, 0.1], [1, 0.67, 0.00]])
 class_names = ["car", "pedestrian"]
 
 
-def draw_bbox_on_img(img, x, y, w, h, labels, scores=None, conf=0.5, nms=0.45, label="", linewidth=2):
+def draw_bbox_on_img(img, x, y, w, h, labels, scores=None, conf=0.5, nms=0.45, label="", linewidth=4):
     if scores is not None:
         mask = filter_boxes(x, y, w, h, labels, scores, conf, nms)
         x = x[mask]
@@ -54,6 +54,14 @@ def draw_bbox_on_img(img, x, y, w, h, labels, scores=None, conf=0.5, nms=0.45, l
     return img
 
 def filter_boxes(x, y, w, h, labels, scores, conf, nms):
+    # Copy out of any structured-array view so torch.from_numpy gets contiguous strides
+    x = np.ascontiguousarray(x, dtype=np.float32).copy()
+    y = np.ascontiguousarray(y, dtype=np.float32).copy()
+    w = np.ascontiguousarray(w, dtype=np.float32).copy()
+    h = np.ascontiguousarray(h, dtype=np.float32).copy()
+    labels = np.ascontiguousarray(labels, dtype=np.int64).copy()
+    scores = np.ascontiguousarray(scores, dtype=np.float32).copy()
+
     mask = scores > conf
 
     x1, y1 = x + w, y + h
@@ -61,7 +69,7 @@ def filter_boxes(x, y, w, h, labels, scores, conf, nms):
 
     nms_out_index = torchvision.ops.batched_nms(
         torch.from_numpy(box_coords),
-        torch.from_numpy(np.ascontiguousarray(scores)),
+        torch.from_numpy(scores),
         torch.from_numpy(labels),
         nms
     )

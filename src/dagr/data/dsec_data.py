@@ -111,6 +111,14 @@ class DSEC(Dataset):
                                                                  only_perfect_tracks=only_perfect_tracks,
                                                                  scale=scale)
 
+        # When running inference without evaluation, we want detections for every frame
+        # pair in the sequence, not only frames that already have ground-truth tracks.
+        if self.no_eval:
+            from dagr.data.dsec_utils import construct_pairs
+            for directory_path in self.dataset.subsequence_directories:
+                n_img = len(self.dataset.directories[directory_path.name].images.timestamps)
+                self.image_index_pairs[directory_path.name] = construct_pairs(np.arange(n_img), 2)
+
     def set_num_us(self, num_us):
         self.num_us = num_us
 

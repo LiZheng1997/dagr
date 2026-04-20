@@ -5,8 +5,10 @@ from __future__ import print_function
 import os
 import contextlib
 from pycocotools.coco import COCO
-from detectron2.evaluation.fast_eval_api import COCOeval_opt as COCOeval
-#from detectron2.evaluation.fast_eval_api import COCOeval
+try:
+    from detectron2.evaluation.fast_eval_api import COCOeval_opt as COCOeval
+except ImportError:
+    from pycocotools.cocoeval import COCOeval
 
 import numpy as np
 from typing import List, Dict, Tuple

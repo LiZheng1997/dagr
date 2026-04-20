@@ -30,9 +30,17 @@ class MySplineConv(SplineConv):
         edge_attr = dxy.view((2,-1)).t()
 
         bil_w, indices = spline_basis(edge_attr.to(self.weight.data.device), self.kernel_size, self.is_open_spline, self.degree)
-        lut_weights = (bil_w[...,None,None] * self.weight[indices]).sum(1)
+        N = bil_w.shape[0]
+        chunk = max(1, min(N, 1024))
+        lut_chunks = []
+        for i in range(0, N, chunk):
+            j = min(i + chunk, N)
+            lut_chunks.append((bil_w[i:j, :, None, None] * self.weight[indices[i:j]]).sum(1).half())
+        lut_weights = torch.cat(lut_chunks, dim=0)
+        del lut_chunks
         _, cin, cout = lut_weights.shape
         self.lut_weights = lut_weights.view((2 * rx + 1, 2 * ry + 1, cin, cout))
+        torch.cuda.empty_cache()
 
         self.message = self.message_lut
 
@@ -41,9 +49,17 @@ class MySplineConv(SplineConv):
         dx_index = (edge_attr[:,0] * self.attr_remapping_matrix[0,0] + self.attr_remapping_matrix[0,-1]+1e-3).long()
         dy_index = (edge_attr[:,1] * self.attr_remapping_matrix[1,1] + self.attr_remapping_matrix[1,-1]+1e-3).long()
 
-        weights = self.lut_weights[dx_index, dy_index] # N x C_out x C_in
-        x_out = torch.einsum("nio,ni->no", weights, x_j)
-
+        # Chunked fp16 einsum to avoid materialising N x Cin x Cout in fp32 (2GB+ for layer5).
+        N = dx_index.shape[0]
+        out_dtype = x_j.dtype
+        x_h = x_j.half()
+        chunks = []
+        chunk = max(1, min(N, 16384))
+        for i in range(0, N, chunk):
+            j = min(i + chunk, N)
+            w = self.lut_weights[dx_index[i:j], dy_index[i:j]]  # fp16 (M, Cin, Cout)
+            chunks.append(torch.einsum("nio,ni->no", w, x_h[i:j]))
+        x_out = torch.cat(chunks, dim=0).to(out_dtype)
         return x_out
 
     def forward(self, data: Data)->Data:

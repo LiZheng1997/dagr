@@ -1,6 +1,26 @@
 *.so
 *.egg-info/
 *.pyc
+__pycache__/
 build/
 libs/
 .idea/
+.vscode/
+
+# Datasets — DSEC fragments should be fetched from the DSEC website,
+# not committed. Pretrained checkpoints (data/*.pth) likewise.
+# Top-level /data/ only — keep src/dagr/data/ (the python package).
+/data/
+
+# Training/evaluation runs
+log/
+log_seqs/
+
+# TRT artifacts — hardware + TRT version specific, rebuild via
+# ipc/export_cnn_trt.py after install.
+*.engine
+*.onnx
+
+# Editor/OS
+*.swp
+.DS_Store

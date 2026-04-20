@@ -29,7 +29,11 @@ class Cartesian(torch.nn.Module):
 
     def forward(self, data):
         if data.edge_index.shape[1] > 0:
-            return T.Cartesian.__call__(self, data)
+            # Don't go through T.Cartesian.__call__: in PyG >= 2.3
+            # BaseTransform.__call__ dispatches to self.forward(copy(data)),
+            # which is THIS forward — infinite recursion. Call the
+            # transform body directly.
+            return T.Cartesian.forward(self, data)
         else:
             data.edge_attr = torch.zeros((0, 3), dtype=data.x.dtype, device=data.x.device)
             return data

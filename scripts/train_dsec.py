@@ -21,6 +21,7 @@ from dagr.data.dsec_data import DSEC
 
 from dagr.model.networks.dagr import DAGR
 from dagr.model.networks.ema import ModelEMA
+from dagr.model.adaptive_sampler import AdaptiveEventSampler, AdaptiveSamplerConfig
 
 
 def gradients_broken(model):
@@ -39,18 +40,144 @@ def fix_gradients(model):
             param.grad = torch.nan_to_num(param.grad, nan=0.0)
 
 
+class EventSelector:
+    def __init__(self, mode: str, budget: int,
+                 candidate_budget: int = -1,
+                 sampler: AdaptiveEventSampler = None):
+        self.mode = mode
+        self.budget = budget
+        self.candidate_budget = candidate_budget
+        self.sampler = sampler
+
+    @property
+    def enabled(self):
+        return self.mode != "none" and self.budget > 0
+
+    def _latest_indices(self, local_indices):
+        if local_indices.numel() <= self.budget:
+            return local_indices
+        return local_indices[-self.budget:]
+
+    def _adaptive_indices(self, data, local_indices):
+        if (self.candidate_budget > self.budget
+                and local_indices.numel() > self.candidate_budget):
+            local_indices = local_indices[-self.candidate_budget:]
+
+        if local_indices.numel() <= self.budget:
+            return local_indices
+
+        events = {
+            "x": data.pos[local_indices, 0].long(),
+            "y": data.pos[local_indices, 1].long(),
+            "t": data.t[local_indices].float() / float(data.time_window[0]),
+            "p": data.x[local_indices].view(-1).long(),
+        }
+        score_map = self.sampler.compute_score_map(events, None)
+        scores = self.sampler._per_event_score(events, score_map)
+        keep_local = scores.topk(self.budget).indices.sort().values
+        return local_indices[keep_local]
+
+    def __call__(self, data):
+        if not self.enabled:
+            return data, None
+
+        keep_indices = []
+        before = int(data.x.shape[0])
+        per_graph_after = []
+        num_graphs = int(data.num_graphs)
+
+        with torch.no_grad():
+            for batch_idx in range(num_graphs):
+                local_indices = torch.nonzero(
+                    data.batch == batch_idx, as_tuple=False
+                ).view(-1)
+                if self.mode == "adaptive":
+                    selected = self._adaptive_indices(data, local_indices)
+                else:
+                    selected = self._latest_indices(local_indices)
+                keep_indices.append(selected)
+                per_graph_after.append(int(selected.numel()))
+
+        if not keep_indices:
+            return data, None
+
+        keep = torch.cat(keep_indices).sort().values
+        data.x = data.x[keep]
+        data.pos = data.pos[keep]
+        if hasattr(data, "t") and data.t is not None:
+            data.t = data.t[keep]
+        if hasattr(data, "batch") and data.batch is not None:
+            data.batch = data.batch[keep]
+        if hasattr(data, "ptr"):
+            ptr = [0]
+            for count in per_graph_after:
+                ptr.append(ptr[-1] + count)
+            data.ptr = torch.tensor(ptr, dtype=torch.long, device=data.x.device)
+            if hasattr(data, "_slice_dict"):
+                for key in ("x", "pos", "t"):
+                    if key in data._slice_dict:
+                        data._slice_dict[key] = data.ptr
+
+        stats = {
+            "before": before,
+            "after": int(data.x.shape[0]),
+            "fraction": float(data.x.shape[0]) / max(1, before),
+        }
+        return data, stats
+
+
+def build_event_selector(args, height: int, width: int, device: str):
+    mode = getattr(args, "event_selection", "none")
+    budget = getattr(args, "event_budget", -1)
+    if mode == "none" or budget <= 0:
+        return EventSelector("none", -1)
+
+    candidate_budget = getattr(args, "event_candidate_budget", -1)
+    sampler = None
+    if mode == "adaptive":
+        if args.adaptive_sampler_checkpoint is None:
+            raise ValueError(
+                "--adaptive_sampler_checkpoint is required for adaptive selection"
+            )
+        ckpt = torch.load(args.adaptive_sampler_checkpoint, map_location=device)
+        cfg = AdaptiveSamplerConfig(**ckpt["cfg"])
+        if cfg.sensor_h != height or cfg.sensor_w != width:
+            raise ValueError(
+                f"Sampler size {(cfg.sensor_h, cfg.sensor_w)} does not match "
+                f"dataset size {(height, width)}"
+            )
+        sampler = AdaptiveEventSampler(cfg).to(device).eval()
+        sampler.load_state_dict(ckpt["state_dict"])
+        for param in sampler.parameters():
+            param.requires_grad_(False)
+        print(
+            "[event-selection] loaded adaptive sampler "
+            f"{args.adaptive_sampler_checkpoint}"
+        )
+
+    if candidate_budget > 0:
+        print(f"[event-selection] candidate_budget={candidate_budget}")
+    print(f"[event-selection] mode={mode} budget={budget}")
+    return EventSelector(mode, budget, candidate_budget, sampler)
+
+
 def train(loader: DataLoader,
           model: torch.nn.Module,
           ema: ModelEMA,
           scheduler: torch.optim.lr_scheduler.LambdaLR,
           optimizer: torch.optim.Optimizer,
           args: argparse.ArgumentParser,
+          event_selector: EventSelector = None,
           run_name=""):
 
     model.train()
 
     for i, data in enumerate(tqdm.tqdm(loader, desc=f"Training {run_name}")):
         data = data.cuda(non_blocking=True)
+        if event_selector is not None:
+            data, selection_stats = event_selector(data)
+        else:
+            selection_stats = None
         data = format_data(data)
 
         optimizer.zero_grad(set_to_none=True)
@@ -72,10 +199,37 @@ def train(loader: DataLoader,
         ema.update(model)
 
         training_logs = {f"training/loss/{k}": v for k, v in loss_dict.items()}
-        wandb.log({"training/loss": loss.item(), "training/lr": scheduler.get_last_lr()[-1], **training_logs})
+        logs = {
+            "training/loss": loss.item(),
+            "training/lr": scheduler.get_last_lr()[-1],
+            **training_logs,
+        }
+        if selection_stats is not None:
+            logs.update({
+                "training/event_selection/before": selection_stats["before"],
+                "training/event_selection/after": selection_stats["after"],
+                "training/event_selection/fraction": selection_stats["fraction"],
+            })
+        wandb.log(logs)
+        if i == 0 or (i + 1) % 100 == 0:
+            status = (
+                f"[train] step={i + 1} loss={loss.item():.6f} "
+                f"lr={scheduler.get_last_lr()[-1]:.6e}"
+            )
+            if selection_stats is not None:
+                status += (
+                    " event_selection="
+                    f"{selection_stats['after']}/{selection_stats['before']} "
+                    f"({selection_stats['fraction']:.4f})"
+                )
+            print(status, flush=True)
+
+        if args.max_train_steps > 0 and i + 1 >= args.max_train_steps:
+            break
 
 def run_test(loader: DataLoader,
          model: torch.nn.Module,
+         event_selector: EventSelector = None,
          dry_run_steps: int=-1,
          dataset="gen1"):
 
@@ -85,6 +239,8 @@ def run_test(loader: DataLoader,
 
     for i, data in enumerate(tqdm.tqdm(loader)):
         data = data.cuda()
+        if event_selector is not None:
+            data, _ = event_selector(data)
         data = format_data(data)
 
         detections, targets = model(data)
@@ -105,14 +261,14 @@ if __name__ == '__main__':
     import random
     import numpy as np
 
-    seed = 42
+    args = FLAGS()
+
+    seed = args.seed
     torch_geometric.seed.seed_everything(seed)
     torch.random.manual_seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-
-    args = FLAGS()
 
     output_directory = set_up_logging_directory(args.dataset, args.task, args.output_directory, exp_name=args.exp_name)
     log_hparams(args)
@@ -161,24 +317,41 @@ if __name__ == '__main__':
     start_epoch = checkpointer.restore_if_existing(output_directory, resume_from_best=False)
 
     start_epoch = 0
-    if "resume_checkpoint" in args:
+    if hasattr(args, "resume_checkpoint"):
         start_epoch = checkpointer.restore_checkpoint(args.resume_checkpoint, best=False)
         print(f"Resume from checkpoint at epoch {start_epoch}")
 
-    with torch.no_grad():
-        mapcalc = run_test(test_loader, ema.ema, dry_run_steps=2, dataset=args.dataset)
+    event_selector = build_event_selector(
+        args, height=test_dataset.height, width=test_dataset.width,
+        device="cuda",
+    )
+
+    if not args.skip_initial_eval:
+        with torch.no_grad():
+            mapcalc = run_test(
+                test_loader, ema.ema, event_selector=event_selector,
+                dry_run_steps=args.dry_run_val_steps, dataset=args.dataset,
+            )
         mapcalc.compute()
 
     print("starting to train")
     for epoch in range(start_epoch, args.tot_num_epochs):
-        train(train_loader, model, ema, lr_scheduler, optimizer, args, run_name=wandb.run.name)
+        train(
+            train_loader, model, ema, lr_scheduler, optimizer, args,
+            event_selector=event_selector, run_name=wandb.run.name,
+        )
         checkpointer.checkpoint(epoch, name=f"last_model")
+
+        if args.skip_epoch_eval:
+            continue
 
         if epoch % 3 > 0:
             continue
 
         with torch.no_grad():
-            mapcalc = run_test(test_loader, ema.ema, dataset=args.dataset)
+            mapcalc = run_test(
+                test_loader, ema.ema, event_selector=event_selector,
+                dry_run_steps=args.dry_run_val_steps, dataset=args.dataset,
+            )
             metrics = mapcalc.compute()
             checkpointer.process(metrics, epoch)
-

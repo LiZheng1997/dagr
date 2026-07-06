@@ -27,10 +27,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import optim
 from torch.utils.data import DataLoader
@@ -44,6 +46,11 @@ from dagr.model.adaptive_sampler import (
     AdaptiveEventSampler,
     AdaptiveSamplerConfig,
     coverage_loss,
+    centernet_heatmap_loss,
+    event_selection_coverage_loss,
+    focal_topk_coverage_loss,
+    gaussian_bce_coverage_loss,
+    topk_coverage_loss,
     count_parameters,
 )
 
@@ -113,17 +120,24 @@ def bboxes_to_batched_tensor(per_frame_bboxes) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def train(args):
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"[train-stage1] device={device}")
 
     # --- dataset -------------------------------------------------------------
     ds_root = Path(args.dataset_directory)
     train_ds = DSEC(
-        root=ds_root, split="train", transform=None,
-        num_us=-1, debug=False, min_bbox_height=0, min_bbox_diag=0,
+        root=ds_root, split=args.split, transform=None,
+        debug=False, min_bbox_height=0, min_bbox_diag=0,
         only_perfect_tracks=False,
     )
-    print(f"[train-stage1] train samples: {len(train_ds)}")
+    train_ds.set_num_us(-1)
+    print(f"[train-stage1] split={args.split} samples: {len(train_ds)}")
 
     def collate(batch_list):
         return Batch.from_data_list(batch_list,
@@ -139,6 +153,7 @@ def train(args):
     cfg = AdaptiveSamplerConfig(
         sensor_h=train_ds.height, sensor_w=train_ds.width,
         grid_stride=args.grid_stride, T=args.T_bins, K=args.K,
+        use_image=not args.event_only,
     )
     sampler = AdaptiveEventSampler(cfg).to(device).train()
     print(f"[train-stage1] sampler params: {count_parameters(sampler)}")
@@ -155,9 +170,32 @@ def train(args):
     log_path = out_dir / "stage1_log.txt"
     log_f = open(log_path, "w")
 
+    def save_checkpoint(path: Path, epoch: int):
+        torch.save({
+            'epoch': epoch,
+            'global_step': global_step,
+            'state_dict': sampler.state_dict(),
+            'cfg': cfg.__dict__,
+            'loss_cfg': {
+                'loss_type': args.loss_type,
+                'bg_weight': args.bg_weight,
+                'focal_gamma': args.focal_gamma,
+                'topk_bg_weight': args.topk_bg_weight,
+                'topk_bg_frac': args.topk_bg_frac,
+                'box_cover_weight': args.box_cover_weight,
+                'event_loss_weight': args.event_loss_weight,
+                'gaussian_sigma_scale': args.gaussian_sigma_scale,
+                'gaussian_min_sigma': args.gaussian_min_sigma,
+                'seed': args.seed,
+            },
+        }, path)
+        print(f"  -> saved {path}", flush=True)
+
     # --- loop ----------------------------------------------------------------
     global_step = 0
+    last_epoch = -1
     for epoch in range(args.epochs):
+        last_epoch = epoch
         ep_loss = 0.0
         t0 = time.time()
         for batch in loader:
@@ -168,18 +206,80 @@ def train(args):
 
             score_maps = []
             for events, rgb, _ in per_frame:
-                sm = sampler.compute_score_map(events, rgb)   # [H, W]
+                sm = sampler.compute_score_map(
+                    events, None if args.event_only else rgb)  # [H, W]
                 score_maps.append(sm)
             score_maps = torch.stack(score_maps, dim=0)        # [B, H, W]
 
             bboxes_batched = bboxes_to_batched_tensor(
                 [pf[2] for pf in per_frame]
             )
-            loss = coverage_loss(
-                score_maps, bboxes_batched,
-                sensor_h=train_ds.height, sensor_w=train_ds.width,
-                bg_weight=args.bg_weight,
-            )
+            if args.loss_type == "focal_topk":
+                loss = focal_topk_coverage_loss(
+                    score_maps, bboxes_batched,
+                    sensor_h=train_ds.height, sensor_w=train_ds.width,
+                    bg_weight=args.bg_weight,
+                    focal_gamma=args.focal_gamma,
+                    topk_bg_weight=args.topk_bg_weight,
+                    topk_bg_frac=args.topk_bg_frac,
+                )
+            elif args.loss_type == "gaussian_bce":
+                loss = gaussian_bce_coverage_loss(
+                    score_maps, bboxes_batched,
+                    sensor_h=train_ds.height, sensor_w=train_ds.width,
+                    bg_weight=args.bg_weight,
+                    sigma_scale=args.gaussian_sigma_scale,
+                    min_sigma=args.gaussian_min_sigma,
+                )
+            elif args.loss_type == "centernet":
+                loss = centernet_heatmap_loss(
+                    score_maps, bboxes_batched,
+                    sensor_h=train_ds.height, sensor_w=train_ds.width,
+                    sigma_scale=args.gaussian_sigma_scale,
+                    min_sigma=args.gaussian_min_sigma,
+                )
+            elif args.loss_type == "bce_topk":
+                loss = topk_coverage_loss(
+                    score_maps, bboxes_batched,
+                    sensor_h=train_ds.height, sensor_w=train_ds.width,
+                    bg_weight=args.bg_weight,
+                    topk_bg_weight=args.topk_bg_weight,
+                    topk_bg_frac=args.topk_bg_frac,
+                )
+            elif args.loss_type == "event_topk":
+                loss = torch.stack([
+                    event_selection_coverage_loss(
+                        sampler, score_maps[i], events, bboxes,
+                        bg_weight=args.bg_weight,
+                        topk_bg_weight=args.topk_bg_weight,
+                        topk_bg_frac=args.topk_bg_frac,
+                        box_cover_weight=args.box_cover_weight,
+                    )
+                    for i, (events, _, bboxes) in enumerate(per_frame)
+                ]).mean()
+            elif args.loss_type == "hybrid_event_bce":
+                dense_loss = coverage_loss(
+                    score_maps, bboxes_batched,
+                    sensor_h=train_ds.height, sensor_w=train_ds.width,
+                    bg_weight=args.bg_weight,
+                )
+                event_loss = torch.stack([
+                    event_selection_coverage_loss(
+                        sampler, score_maps[i], events, bboxes,
+                        bg_weight=args.bg_weight,
+                        topk_bg_weight=args.topk_bg_weight,
+                        topk_bg_frac=args.topk_bg_frac,
+                        box_cover_weight=args.box_cover_weight,
+                    )
+                    for i, (events, _, bboxes) in enumerate(per_frame)
+                ]).mean()
+                loss = dense_loss + args.event_loss_weight * event_loss
+            else:
+                loss = coverage_loss(
+                    score_maps, bboxes_batched,
+                    sensor_h=train_ds.height, sensor_w=train_ds.width,
+                    bg_weight=args.bg_weight,
+                )
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -196,6 +296,13 @@ def train(args):
                 print(msg, flush=True)
                 log_f.write(msg + "\n"); log_f.flush()
 
+            if args.max_steps > 0 and global_step >= args.max_steps:
+                print(f"[train-stage1] hit max_steps={args.max_steps}, stopping.",
+                      flush=True)
+                break
+        if args.max_steps > 0 and global_step >= args.max_steps:
+            break
+
         ep_mean = ep_loss / max(1, len(loader))
         dt = time.time() - t0
         msg = (f"[epoch {epoch}] mean_loss={ep_mean:.4f} "
@@ -205,13 +312,10 @@ def train(args):
 
         # Save checkpoint each epoch.
         ckpt_path = out_dir / f"sampler_stage1_epoch{epoch}.pth"
-        torch.save({
-            'epoch': epoch,
-            'state_dict': sampler.state_dict(),
-            'cfg': cfg.__dict__,
-        }, ckpt_path)
-        print(f"  -> saved {ckpt_path}", flush=True)
+        save_checkpoint(ckpt_path, epoch)
 
+    final_ckpt_path = out_dir / "sampler_stage1_final.pth"
+    save_checkpoint(final_ckpt_path, last_epoch)
     log_f.close()
     print(f"[train-stage1] done. Artifacts at {out_dir}")
 
@@ -234,7 +338,29 @@ def main():
     ap.add_argument("--T_bins", type=int, default=8)
     ap.add_argument("--K", type=int, default=10000)
     ap.add_argument("--bg_weight", type=float, default=0.1)
+    ap.add_argument("--loss_type",
+                    choices=["bce", "bce_topk", "focal_topk",
+                             "gaussian_bce", "centernet", "event_topk",
+                             "hybrid_event_bce"],
+                    default="bce")
+    ap.add_argument("--focal_gamma", type=float, default=2.0)
+    ap.add_argument("--topk_bg_weight", type=float, default=0.2)
+    ap.add_argument("--topk_bg_frac", type=float, default=0.10)
+    ap.add_argument("--box_cover_weight", type=float, default=0.5)
+    ap.add_argument("--event_loss_weight", type=float, default=0.25)
+    ap.add_argument("--gaussian_sigma_scale", type=float, default=0.30)
+    ap.add_argument("--gaussian_min_sigma", type=float, default=1.0)
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log_every", type=int, default=20)
+    ap.add_argument("--event_only", action="store_true",
+                    help="Train the sampler from event voxels only. Use this "
+                         "when RGB images are missing or intentionally ablated.")
+    ap.add_argument("--split", type=str, default="train",
+                    choices=["train", "val", "test"],
+                    help="DSEC split. Use 'test' on DSEC_fragment.")
+    ap.add_argument("--max_steps", type=int, default=-1,
+                    help="If >0, stop after this many optimizer steps "
+                         "(useful for sanity checks).")
     args = ap.parse_args()
     train(args)
 

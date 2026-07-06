@@ -27,6 +27,13 @@ def BASE_FLAGS():
     parser.add_argument('--time_window_us', default=argparse.SUPPRESS, type=int)
     parser.add_argument('--max_neighbors', default=argparse.SUPPRESS, type=int)
     parser.add_argument('--n_nodes', default=argparse.SUPPRESS, type=int)
+    parser.add_argument("--event_selection",
+                        choices=["none", "latest", "adaptive"],
+                        default="none")
+    parser.add_argument("--event_budget", type=int, default=-1)
+    parser.add_argument("--event_candidate_budget", type=int, default=-1)
+    parser.add_argument("--adaptive_sampler_checkpoint",
+                        type=Path, default=None)
 
     # learning params
     parser.add_argument('--batch_size', default=argparse.SUPPRESS, type=int)
@@ -61,6 +68,11 @@ def FLAGS():
     parser.add_argument('--l_r', default=argparse.SUPPRESS, type=float)
     parser.add_argument('--no_eval', action="store_true")
     parser.add_argument('--tot_num_epochs', default=argparse.SUPPRESS, type=int)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_train_steps", type=int, default=-1)
+    parser.add_argument("--dry_run_val_steps", type=int, default=2)
+    parser.add_argument("--skip_initial_eval", action="store_true")
+    parser.add_argument("--skip_epoch_eval", action="store_true")
 
     parser.add_argument('--run_test', action="store_true")
 

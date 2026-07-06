@@ -2,7 +2,7 @@
 
 ## Goal
 
-Use Ray to schedule reproducible DAGR detector experiments across the P40 GPUs.
+Use Ray to schedule reproducible DAGR detector experiments across the available GPUs.
 The standard comparison is:
 
 | Mode | Meaning |
@@ -14,6 +14,25 @@ The standard comparison is:
 Ray is used as a multi-experiment GPU scheduler. It does not make one detector
 training process use multiple GPUs. For one model on multiple GPUs, add DDP or
 Ray Train separately.
+
+2026-07-06 hardware update:
+
+```text
+Ray-visible GPUs: 2 x Tesla V100 32GB + 4 x Tesla P40 24GB
+Ray resources: GPU=6, P40=4, V100=2
+```
+
+The detector wrapper now supports:
+
+```bash
+--gpu_resource any   # default; schedule on any available Ray GPU
+--gpu_resource P40   # consume logical P40 resource
+--gpu_resource V100  # consume logical V100 resource
+```
+
+Use `any` for six-way multi-experiment throughput. On this single mixed-GPU
+node, `P40` and `V100` are logical Ray resource counters; they are useful for
+throttling but should not be treated as strict physical GPU binding.
 
 ## Main Wrapper
 
@@ -51,7 +70,8 @@ cd /home/userroot/dagr-ray
   --batch_size 8 \
   --event_budget 5000 \
   --max_train_steps 200 \
-  --dry_run_val_steps 100
+  --dry_run_val_steps 100 \
+  --gpu_resource any
 ```
 
 For a pure throughput run without detector validation:
@@ -66,7 +86,8 @@ cd /home/userroot/dagr-ray
   --batch_size 8 \
   --event_budget 5000 \
   --max_train_steps 200 \
-  --skip_epoch_eval
+  --skip_epoch_eval \
+  --gpu_resource any
 ```
 
 ## Key Parameters
@@ -82,6 +103,7 @@ cd /home/userroot/dagr-ray
 | `--max_train_steps` | Detector optimizer steps per trial. |
 | `--dry_run_val_steps` | Validation batches for quick metric smoke tests. |
 | `--skip_epoch_eval` | Skip validation and measure training throughput only. |
+| `--gpu_resource` | `any`, `P40`, or `V100`; defaults to `any` after the V100 expansion. |
 | `--run_name` | Output directory name under the Ray pipeline output root. |
 | `--exp_prefix` | Prefix for individual detector experiment names. |
 
@@ -159,4 +181,4 @@ If this quick comparison is stable, scale to four seeds:
 ```
 
 That produces 12 detector trials. Ray will queue and schedule them across the
-four P40 GPUs.
+six Ray-visible GPUs when `--gpu_resource any` is used.

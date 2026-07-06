@@ -21,6 +21,7 @@ DAGR_DIR = Path("/home/userroot/dagr-adaptive-sampling")
 DATASET_DIR = Path("/home/userroot/datasets/dsec-det")
 DEFAULT_OUT_ROOT = Path("/home/userroot/training_outputs/ray_stage1_smoke")
 PYTHON = "/home/userroot/anaconda3/envs/dagr/bin/python"
+GPU_RESOURCE_CHOICES = ("any", "P40", "V100")
 PYTHONPATH = ":".join(
     [
         str(DAGR_DIR / "src"),
@@ -29,6 +30,14 @@ PYTHONPATH = ":".join(
         os.environ.get("PYTHONPATH", ""),
     ]
 )
+
+
+def ray_remote_options(gpu_resource: str) -> dict:
+    if gpu_resource == "any":
+        return {}
+    if gpu_resource not in GPU_RESOURCE_CHOICES:
+        raise ValueError(f"Unsupported gpu_resource: {gpu_resource}")
+    return {"resources": {gpu_resource: 1}}
 
 
 EXPERIMENTS = [
@@ -356,7 +365,7 @@ def parse_loss(log_path: Path) -> str | None:
     return loss_lines[-1] if loss_lines else None
 
 
-@ray.remote(num_cpus=2, num_gpus=1, resources={"P40": 1})
+@ray.remote(num_cpus=2, num_gpus=1)
 def run_stage1_experiment(config: dict) -> dict:
     run_dir = Path(config["out_root"]) / config["name"]
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -444,6 +453,7 @@ def run_stage1_experiment(config: dict) -> dict:
         "name": config["name"],
         "returncode": proc.returncode,
         "elapsed_sec": elapsed,
+        "gpu_resource": config.get("gpu_resource", "any"),
         "ray_gpu_ids": gpu_ids,
         "cuda_visible_devices": env.get("CUDA_VISIBLE_DEVICES", ""),
         "assigned_resources": assigned,
@@ -468,6 +478,11 @@ def main() -> None:
                                  "bce_topk", "gaussian", "seed_highbg",
                                  "event_topk", "hybrid_event"],
                         default="baseline")
+    parser.add_argument("--gpu_resource", choices=GPU_RESOURCE_CHOICES,
+                        default="any",
+                        help="Logical Ray resource per trial. Use 'any' to "
+                             "schedule on any GPU, or P40/V100 to consume the "
+                             "corresponding custom resource.")
     args = parser.parse_args()
 
     args.out_root.mkdir(parents=True, exist_ok=True)
@@ -491,12 +506,15 @@ def main() -> None:
     else:
         experiments = EXPERIMENTS
     futures = [
-        run_stage1_experiment.remote(
+        run_stage1_experiment.options(
+            **ray_remote_options(args.gpu_resource)
+        ).remote(
             {
                 **exp,
                 "max_steps": args.max_steps,
                 "out_root": str(args.out_root),
                 "event_only": not args.use_image,
+                "gpu_resource": args.gpu_resource,
             }
         )
         for exp in experiments

@@ -20,6 +20,7 @@ DAGR_DIR = Path("/home/userroot/dagr-adaptive-sampling")
 PYTHON = "/home/userroot/anaconda3/envs/dagr/bin/python"
 DATASET_DIR = Path("/home/userroot/datasets")
 DEFAULT_OUT_ROOT = Path("/home/userroot/training_outputs/dagr-official-benchmark")
+GPU_RESOURCE_CHOICES = ("any", "P40", "V100")
 PYTHONPATH = ":".join(
     [
         str(DAGR_DIR / "src"),
@@ -30,13 +31,21 @@ PYTHONPATH = ":".join(
 )
 
 
+def ray_remote_options(gpu_resource: str) -> dict:
+    if gpu_resource == "any":
+        return {}
+    if gpu_resource not in GPU_RESOURCE_CHOICES:
+        raise ValueError(f"Unsupported gpu_resource: {gpu_resource}")
+    return {"resources": {gpu_resource: 1}}
+
+
 def tail_lines(path: Path, n: int = 80) -> list[str]:
     if not path.exists():
         return []
     return path.read_text(errors="replace").splitlines()[-n:]
 
 
-@ray.remote(num_cpus=3, num_gpus=1, resources={"P40": 1})
+@ray.remote(num_cpus=3, num_gpus=1)
 def run_trial(config: dict) -> dict:
     name = config["name"]
     run_dir = Path(config["out_root"]) / name
@@ -108,6 +117,7 @@ def run_trial(config: dict) -> dict:
         "elapsed_sec": elapsed,
         "batch_size": batch_size,
         "max_train_steps": max_train_steps,
+        "gpu_resource": config.get("gpu_resource", "any"),
         "samples": samples,
         "steps_per_sec": round(max_train_steps / elapsed, 4)
         if proc.returncode == 0 and elapsed > 0 else 0.0,
@@ -135,6 +145,11 @@ def main() -> None:
                         default=DEFAULT_OUT_ROOT / "ray_runs")
     parser.add_argument("--detector_output_root", type=Path,
                         default=DEFAULT_OUT_ROOT / "detector_runs")
+    parser.add_argument("--gpu_resource", choices=GPU_RESOURCE_CHOICES,
+                        default="any",
+                        help="Logical Ray resource per trial. Use 'any' to "
+                             "schedule on any GPU, or P40/V100 to consume the "
+                             "corresponding custom resource.")
     args = parser.parse_args()
 
     args.out_root.mkdir(parents=True, exist_ok=True)
@@ -145,13 +160,14 @@ def main() -> None:
     print("[dagr-official] available_resources=", ray.available_resources())
 
     futures = [
-        run_trial.remote(
+        run_trial.options(**ray_remote_options(args.gpu_resource)).remote(
             {
                 "name": f"official_none_b{args.batch_size}_trial{i}",
                 "out_root": str(args.out_root),
                 "detector_output_root": str(args.detector_output_root),
                 "batch_size": args.batch_size,
                 "max_train_steps": args.max_train_steps,
+                "gpu_resource": args.gpu_resource,
             }
         )
         for i in range(args.num_trials)

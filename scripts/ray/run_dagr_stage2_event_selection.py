@@ -20,6 +20,7 @@ DAGR_DIR = Path("/home/userroot/dagr-adaptive-sampling")
 PYTHON = "/home/userroot/anaconda3/envs/dagr/bin/python"
 DATASET_DIR = Path("/home/userroot/datasets")
 DEFAULT_OUT_ROOT = Path("/home/userroot/training_outputs/dagr-detector-stage2")
+GPU_RESOURCE_CHOICES = ("any", "P40", "V100")
 ADAPTIVE_BG1_CKPT = Path(
     "/home/userroot/training_outputs/dagr-stage1/20260426_seed_highbg_5000step/"
     "stage1_seed45_k5000_lr3e-4_bg1.00/sampler_stage1_final.pth"
@@ -36,6 +37,14 @@ PYTHONPATH = ":".join(
         os.environ.get("PYTHONPATH", ""),
     ]
 )
+
+
+def ray_remote_options(gpu_resource: str) -> dict:
+    if gpu_resource == "any":
+        return {}
+    if gpu_resource not in GPU_RESOURCE_CHOICES:
+        raise ValueError(f"Unsupported gpu_resource: {gpu_resource}")
+    return {"resources": {gpu_resource: 1}}
 
 
 BASELINE_EXPERIMENTS = [
@@ -113,7 +122,7 @@ def best_checkpoint(detector_output_root: Path, name: str) -> tuple[str, float |
     return str(best_path), best_map
 
 
-@ray.remote(num_cpus=3, num_gpus=1, resources={"P40": 1})
+@ray.remote(num_cpus=3, num_gpus=1)
 def run_detector_experiment(config: dict) -> dict:
     run_dir = Path(config["out_root"]) / config["name"]
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -200,6 +209,7 @@ def run_detector_experiment(config: dict) -> dict:
         "elapsed_sec": elapsed,
         "best_checkpoint": best_path,
         "best_mAP": best_map,
+        "gpu_resource": config.get("gpu_resource", "any"),
         "ray_gpu_ids": gpu_ids,
         "cuda_visible_devices": env.get("CUDA_VISIBLE_DEVICES", ""),
         "assigned_resources": assigned,
@@ -225,6 +235,11 @@ def main() -> None:
     parser.add_argument("--experiment_set",
                         choices=["baseline", "recent"],
                         default="baseline")
+    parser.add_argument("--gpu_resource", choices=GPU_RESOURCE_CHOICES,
+                        default="any",
+                        help="Logical Ray resource per trial. Use 'any' to "
+                             "schedule on any GPU, or P40/V100 to consume the "
+                             "corresponding custom resource.")
     args = parser.parse_args()
 
     args.out_root.mkdir(parents=True, exist_ok=True)
@@ -240,7 +255,9 @@ def main() -> None:
     }[args.experiment_set]
 
     futures = [
-        run_detector_experiment.remote(
+        run_detector_experiment.options(
+            **ray_remote_options(args.gpu_resource)
+        ).remote(
             {
                 **exp,
                 "out_root": str(args.out_root),
@@ -248,6 +265,7 @@ def main() -> None:
                 "max_train_steps": args.max_train_steps,
                 "dry_run_val_steps": args.dry_run_val_steps,
                 "skip_epoch_eval": args.skip_epoch_eval,
+                "gpu_resource": args.gpu_resource,
             }
         )
         for exp in experiments

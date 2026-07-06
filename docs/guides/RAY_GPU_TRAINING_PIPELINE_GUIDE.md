@@ -3,11 +3,11 @@
 This guide records the reusable GPU training workflow for the P40 host and the
 current DAGR adaptive-sampling experiments.
 
-## 1. Current P40 Setup
+## 1. Current GPU Setup
 
 ```text
 Host: userroot@192.168.103.2
-GPU: 4 x Tesla P40 24GB
+GPU: 2 x Tesla V100 32GB + 4 x Tesla P40 24GB
 Ray dashboard: http://192.168.103.2:8265
 Ray CLI: /home/userroot/miniconda3/bin/ray
 DAGR env: /home/userroot/anaconda3/envs/dagr
@@ -16,6 +16,36 @@ Ray wrapper dir: /home/userroot/dagr-ray
 Dataset: /home/userroot/datasets/dsec-det
 Output root: /home/userroot/training_outputs
 ```
+
+Current Ray startup after the V100 expansion:
+
+```bash
+/home/userroot/miniconda3/bin/ray start --head \
+  --dashboard-host=0.0.0.0 \
+  --num-gpus=6 \
+  --resources='{"P40":4,"V100":2}'
+```
+
+Verified Ray resources:
+
+```text
+CPU: 56
+GPU: 6
+P40: 4
+V100: 2
+```
+
+Important limitation:
+
+```text
+Ray custom resources such as P40=1 or V100=1 are node-level logical
+resources. On a single mixed-GPU node, they do not by themselves bind a task to
+a physical P40 or V100 CUDA device.
+```
+
+For current DAGR multi-experiment sweeps, use `--gpu_resource any` to let Ray
+schedule across all six GPUs. Use `--gpu_resource P40` or `--gpu_resource V100`
+only as a logical throttle, not as a strict physical GPU selector.
 
 Storage rule:
 
@@ -38,7 +68,7 @@ Do not point current jobs at `/data/nas` directly.
 
 Ray can already schedule all four P40 GPUs on this host.
 
-Current execution mode:
+Original P40-only execution mode:
 
 ```python
 @ray.remote(num_cpus=2, num_gpus=1, resources={"P40": 1})
@@ -53,6 +83,24 @@ Ray sets CUDA_VISIBLE_DEVICES per worker
 each worker writes train_stdout.log, stage1_log.txt, ray_result.json
 the sweep writes summary.json
 ```
+
+Current wrapper execution mode:
+
+```python
+@ray.remote(num_cpus=2, num_gpus=1)
+```
+
+The wrapper adds an optional runtime resource request:
+
+```bash
+--gpu_resource any   # default; use all Ray-visible GPUs
+--gpu_resource P40   # consume logical P40 resource
+--gpu_resource V100  # consume logical V100 resource
+```
+
+On the current mixed single-node host, `any` is the recommended setting for
+throughput. It allows six concurrent one-GPU experiments when the workload can
+run on either P40 or V100.
 
 Observed 5000-step high-background BCE sweep:
 
@@ -102,6 +150,7 @@ cd /home/userroot/dagr-ray
   -- python run_adaptive_stage1_multi.py \
        --sweep high_bg \
        --max_steps 5000 \
+       --gpu_resource any \
        --out_root /home/userroot/training_outputs/dagr-stage1/<run_id>
 ```
 
@@ -136,6 +185,24 @@ trainer = TorchTrainer(
     ),
 )
 result = trainer.fit()
+```
+
+## 3.1 Official Ray References
+
+Useful official documentation:
+
+```text
+Ray Core accelerator support:
+https://docs.ray.io/en/latest/ray-core/scheduling/accelerators.html
+
+Ray Core resource scheduling and custom resources:
+https://docs.ray.io/en/latest/ray-core/scheduling/resources.html
+
+Ray Jobs submission:
+https://docs.ray.io/en/latest/cluster/running-applications/job-submission/index.html
+
+Ray Train accelerator configuration:
+https://docs.ray.io/en/latest/train/user-guides/using-accelerators.html
 ```
 
 ### Mode C: Ray Tune Search

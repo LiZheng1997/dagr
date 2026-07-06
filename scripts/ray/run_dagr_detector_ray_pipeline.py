@@ -26,6 +26,7 @@ DEFAULT_ADAPTIVE_CKPT = Path(
     "/home/userroot/training_outputs/dagr-stage1/20260426_seed_highbg_5000step/"
     "stage1_seed45_k5000_lr3e-4_bg1.00/sampler_stage1_final.pth"
 )
+GPU_RESOURCE_CHOICES = ("any", "P40", "V100")
 
 
 def csv_list(value: str) -> list[str]:
@@ -34,6 +35,14 @@ def csv_list(value: str) -> list[str]:
 
 def csv_ints(value: str) -> list[int]:
     return [int(item) for item in csv_list(value)]
+
+
+def ray_remote_options(gpu_resource: str) -> dict:
+    if gpu_resource == "any":
+        return {}
+    if gpu_resource not in GPU_RESOURCE_CHOICES:
+        raise ValueError(f"Unsupported gpu_resource: {gpu_resource}")
+    return {"resources": {gpu_resource: 1}}
 
 
 def tail_lines(path: Path, n: int = 80) -> list[str]:
@@ -175,7 +184,7 @@ def command_for_trial(config: dict) -> list[str]:
     return cmd
 
 
-@ray.remote(num_cpus=3, num_gpus=1, resources={"P40": 1})
+@ray.remote(num_cpus=3, num_gpus=1)
 def run_trial(config: dict) -> dict:
     run_dir = Path(config["out_root"]) / config["name"]
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -234,6 +243,7 @@ def run_trial(config: dict) -> dict:
         "event_budget": config.get("event_budget", -1),
         "event_candidate_budget": config.get("event_candidate_budget", -1),
         "adaptive_sampler_checkpoint": config.get("adaptive_sampler_checkpoint", ""),
+        "gpu_resource": config.get("gpu_resource", "any"),
         "seed": config["seed"],
         "batch_size": batch_size,
         "max_train_steps": max_steps,
@@ -343,6 +353,11 @@ def main() -> None:
     parser.add_argument("--detector_output_root", type=Path, default=None)
     parser.add_argument("--wandb_mode", default="offline")
     parser.add_argument("--omp_threads", type=int, default=2)
+    parser.add_argument("--gpu_resource", choices=GPU_RESOURCE_CHOICES,
+                        default="any",
+                        help="Logical Ray resource per trial. Use 'any' to "
+                             "schedule on any GPU, or P40/V100 to consume the "
+                             "corresponding custom resource.")
     args = parser.parse_args()
 
     run_name = args.run_name or time.strftime("%Y%m%d_%H%M%S_dagr_detector")
@@ -375,6 +390,7 @@ def main() -> None:
         "run_initial_eval": args.run_initial_eval,
         "wandb_mode": args.wandb_mode,
         "omp_threads": args.omp_threads,
+        "gpu_resource": args.gpu_resource,
     }
     trial_configs = [{**common, **exp} for exp in experiments]
     (out_root / "pipeline_config.json").write_text(
@@ -387,7 +403,10 @@ def main() -> None:
     print("[dagr-ray] run_name=", run_name)
     print("[dagr-ray] trials=", len(trial_configs))
 
-    results = ray.get([run_trial.remote(cfg) for cfg in trial_configs])
+    results = ray.get([
+        run_trial.options(**ray_remote_options(cfg["gpu_resource"])).remote(cfg)
+        for cfg in trial_configs
+    ])
     total_elapsed = max((item["elapsed_sec"] for item in results), default=0.0)
     sum_samples = sum(item["samples"] for item in results)
     summary_path = out_root / "summary.json"

@@ -38,6 +38,7 @@ from dagr.utils.args import FLAGS as DAGR_FLAGS
 
 IPC_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(IPC_DIR))
+from fit_transform import make_fit  # noqa: E402
 from protocol import (  # noqa: E402
     SOCKET_PATH,
     MSG_INFER_REQ, MSG_PING, MSG_PONG,
@@ -85,6 +86,43 @@ TIME_WINDOW_NS = 1_000_000_000         # 1 second in ns, matches DSEC config
 #   "genx320"  : events/image live in 320x320 sensor space (GenX320, route a)
 _SENSOR_MODE = "dsec"
 
+# How a non-DSEC sensor frame is fitted into the 320x215 model frame.
+# See ipc/fit_transform.py. "letterbox" keeps the whole field of view, which
+# matters for a forward-facing vehicle camera where the nearest road users sit
+# in the bottom third of the image that the old "crop_top" path discarded.
+_GENX320_FIT = "letterbox"
+
+# Event sensor size per mode. Events and the returned boxes always live in
+# this frame; the image is fitted separately from its own size (it is only
+# geometrically aligned with the events when the ROS node warps RGB into the
+# event frame via calib_yaml, otherwise both are centred full-frame fits).
+_EVENT_SENSOR_SIZE = {"dsec": (640, 480), "genx320": (320, 320)}
+_EVENT_SENSOR_OVERRIDE = None
+_FIT_CACHE = {}
+
+
+def _event_sensor_size():
+    return _EVENT_SENSOR_OVERRIDE or _EVENT_SENSOR_SIZE[_SENSOR_MODE]
+
+
+def _event_fit():
+    w, h = _event_sensor_size()
+    return _fit_for(w, h)
+
+
+def _fit_for(sensor_w: int, sensor_h: int):
+    mode = "dsec" if _SENSOR_MODE == "dsec" else _GENX320_FIT
+    key = (sensor_w, sensor_h, mode)
+    tf = _FIT_CACHE.get(key)
+    if tf is None:
+        tf = make_fit(sensor_w, sensor_h, MODEL_WIDTH, MODEL_HEIGHT, mode)
+        _FIT_CACHE[key] = tf
+        print(f"[infer_server] fit {mode}: sensor {sensor_w}x{sensor_h} -> "
+              f"model {MODEL_WIDTH}x{MODEL_HEIGHT} "
+              f"(sx={tf.sx:.4f} sy={tf.sy:.4f} ox={tf.ox:.1f} oy={tf.oy:.1f})",
+              flush=True)
+    return tf
+
 # Hard cap on events per frame. DSEC bags can push 500k events per 50 ms
 # packet which would OOM the 2070 Max-Q during event graph construction
 # (~1.3 GiB just for edge tensors). The DSEC dataset loader does the same
@@ -97,6 +135,26 @@ def set_sensor_mode(mode: str) -> None:
     if mode not in ("dsec", "genx320"):
         raise ValueError(f"unknown sensor_mode {mode!r}")
     _SENSOR_MODE = mode
+    _FIT_CACHE.clear()
+
+
+def set_genx320_fit(mode: str) -> None:
+    global _GENX320_FIT
+    if mode not in ("letterbox", "squash", "crop_top"):
+        raise ValueError(f"unknown genx320_fit {mode!r}")
+    _GENX320_FIT = mode
+    _FIT_CACHE.clear()
+
+
+def set_event_sensor_size(spec: str) -> None:
+    """'WxH' override of the event sensor frame, '' resets to the mode default."""
+    global _EVENT_SENSOR_OVERRIDE
+    if not spec:
+        _EVENT_SENSOR_OVERRIDE = None
+    else:
+        w, h = (int(v) for v in spec.lower().split("x"))
+        _EVENT_SENSOR_OVERRIDE = (w, h)
+    _FIT_CACHE.clear()
 
 
 def set_max_events_per_frame(n: int) -> None:
@@ -113,18 +171,12 @@ def preprocess_image(bgr: np.ndarray) -> torch.Tensor:
     In ``dsec`` mode the input is expected to be 640x480 (or taller) and gets
     top-cropped to 430 rows then bilinearly resized to 320x215.
 
-    In ``genx320`` mode the input is 320x320 already near the model width, so
-    we skip the crop-then-downsample and just resize straight to 320x215.
+    In ``genx320`` mode the fit is selected by --genx320_fit (default
+    letterbox: whole frame, aspect kept, black side padding).
     """
-    import cv2
     h, w = bgr.shape[:2]
-    if _SENSOR_MODE == "dsec":
-        if h < CROPPED_HEIGHT:
-            pad = np.zeros((CROPPED_HEIGHT - h, w, 3), dtype=bgr.dtype)
-            bgr = np.vstack([bgr, pad])
-        bgr = bgr[:CROPPED_HEIGHT]
-    resized = cv2.resize(bgr, (MODEL_WIDTH, MODEL_HEIGHT), interpolation=cv2.INTER_CUBIC)
-    t = torch.from_numpy(resized).permute(2, 0, 1).unsqueeze(0)
+    resized = _fit_for(w, h).apply_image(bgr)
+    t = torch.from_numpy(np.ascontiguousarray(resized)).permute(2, 0, 1).unsqueeze(0)
     return t
 
 
@@ -134,24 +186,19 @@ def preprocess_events(events: dict) -> dict:
     Input: dict with x, y, t_ns, p numpy arrays.
     Output: dict with x, y, t (int32 relative), p (int8 -1/+1).
 
-    Sensor-mode branches:
-      - ``dsec``:    events come in 640x480 sensor coords, we crop y<430
-                     and halve xy to 320x215 model coords.
-      - ``genx320``: events come in 320x320 sensor coords, we crop y<215
-                     (keep top) and pass xy straight through (model is
-                     already at native sensor resolution in width).
+    Events are mapped from the event sensor frame (320x320 for genx320,
+    640x480 for dsec, or --event_sensor_size) into the 320x215 model frame
+    and anything landing outside it is dropped. For ``dsec`` this is exactly
+    the training loader's crop y<430 followed by halving; for ``genx320`` it
+    follows --genx320_fit. The image is fitted separately from its own size.
     """
-    x = np.asarray(events['x']).astype(np.int16)
-    y = np.asarray(events['y']).astype(np.int16)
+    x = np.asarray(events['x']).astype(np.int32)
+    y = np.asarray(events['y']).astype(np.int32)
     t_ns = np.asarray(events['t_ns']).astype(np.int64)
     p = np.asarray(events['p']).astype(np.int8)
 
-    if _SENSOR_MODE == "dsec":
-        mask = y < CROPPED_HEIGHT
-        x = x[mask]; y = y[mask]; t_ns = t_ns[mask]; p = p[mask]
-    else:  # genx320
-        mask = y < MODEL_HEIGHT
-        x = x[mask]; y = y[mask]; t_ns = t_ns[mask]; p = p[mask]
+    mask, x, y = _event_fit().event_mask_and_coords(x, y)
+    t_ns = t_ns[mask]; p = p[mask]
 
     # Enforce the per-frame event cap (same role as args.n_nodes in the
     # training dataset). Keep the most recent events so the temporal
@@ -174,11 +221,7 @@ def preprocess_events(events: dict) -> dict:
     t_rel_ns = t_ns - t_last + TIME_WINDOW_NS
     t_us = (t_rel_ns // 1000).astype(np.int32)
 
-    if _SENSOR_MODE == "dsec":
-        x = (x // 2).astype(np.int16)
-        y = (y // 2).astype(np.int16)
-    # in genx320 mode, events already live in (MODEL_WIDTH, MODEL_HEIGHT)-compatible coords
-
+    # x, y are already int16 model-frame coordinates from the fit transform.
     return {'x': x, 'y': y, 't': t_us, 'p': p.reshape(-1, 1)}
 
 
@@ -470,18 +513,14 @@ def detections_to_numpy(det: dict) -> np.ndarray:
     scores = det['scores'].detach().cpu().numpy().astype(np.float32)
     out = np.zeros(len(boxes), dtype=dtype)
     if len(boxes):
-        # Boxes are in model coord space (MODEL_WIDTH x MODEL_HEIGHT).
-        # In dsec mode the original sensor is 2x the model dims (640x480),
-        # so boxes get scaled back up. In genx320 mode the sensor is already
-        # at 320x320, so boxes map 1:1 in x. We treat y identically to
-        # preprocess_events: the model-space y coord is directly in sensor
-        # y space (since preprocess did not halve y for genx320).
-        x_scale = SCALE if _SENSOR_MODE == "dsec" else 1
-        y_scale = SCALE if _SENSOR_MODE == "dsec" else 1
-        out['x'] = boxes[:, 0] * x_scale
-        out['y'] = boxes[:, 1] * y_scale
-        out['w'] = (boxes[:, 2] - boxes[:, 0]) * x_scale
-        out['h'] = (boxes[:, 3] - boxes[:, 1]) * y_scale
+        # Boxes are in model coord space (MODEL_WIDTH x MODEL_HEIGHT); invert
+        # the event-frame fit so they land in event sensor pixels, which is
+        # the frame downstream consumers (ROS node, perception_cue) expect.
+        xywh = _event_fit().inv_box_xywh(boxes[:, :4]).astype(np.float32)
+        out['x'] = xywh[:, 0]
+        out['y'] = xywh[:, 1]
+        out['w'] = xywh[:, 2]
+        out['h'] = xywh[:, 3]
         out['class_id'] = labels
         out['class_confidence'] = scores
     return out
@@ -541,14 +580,26 @@ def main():
                              'Excess events are dropped (oldest first).')
     parser.add_argument('--dataset_directory', default='data/DSEC_fragment')
     parser.add_argument('--socket', default=SOCKET_PATH)
+    parser.add_argument('--genx320_fit', choices=['letterbox', 'squash', 'crop_top'],
+                        default='letterbox',
+                        help='how a GenX320 320x320 frame is fitted into the 320x215 '
+                             'model frame. letterbox keeps the whole field of view '
+                             '(default); crop_top is the legacy behaviour that drops '
+                             'the bottom third.')
     parser.add_argument('--sensor_mode', choices=['dsec', 'genx320'], default='dsec',
                         help='Input sensor spatial convention: '
                              'dsec=640x480 events+image, genx320=320x320')
+    parser.add_argument('--event_sensor_size', default='',
+                        help="override the event sensor frame as WxH (default: 640x480 "
+                             "for dsec, 320x320 for genx320); boxes are returned in this frame")
     cli = parser.parse_args()
 
     set_sensor_mode(cli.sensor_mode)
+    set_genx320_fit(cli.genx320_fit)
+    set_event_sensor_size(cli.event_sensor_size)
     set_max_events_per_frame(cli.n_nodes)
     print(f"[infer_server] sensor_mode={cli.sensor_mode} "
+          f"genx320_fit={cli.genx320_fit} "
           f"max_events_per_frame={cli.n_nodes}", flush=True)
     print("[infer_server] building args...", flush=True)
     args = build_args(cli)

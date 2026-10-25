@@ -103,7 +103,7 @@ def match(det, gt, iou_thr, score_thr):
     order = np.argsort(-scores)
     gtb = gt_struct_to_xyxy(gt); used = np.zeros(len(gt), bool)
     ious = iou_xyxy(boxes, gtb)
-    matched, fp = [], 0
+    matched, fp, boxes_out = [], 0, []
     for i in order:
         best, bj = 0.0, -1
         for j in range(len(gt)):
@@ -113,9 +113,16 @@ def match(det, gt, iou_thr, score_thr):
                 best, bj = ious[i, j], j
         if bj >= 0 and best >= iou_thr:
             used[bj] = True; matched.append(int(gt["track_id"][bj]))
+            boxes_out.append([int(gt["track_id"][bj])] + [round(float(v), 1) for v in boxes[i]])
         else:
             fp += 1
-    return matched, fp, int(sel.sum())
+    return matched, fp, int(sel.sum()), boxes_out
+
+
+def gt_list(gt):
+    """[[track_id, x1, y1, x2, y2], ...] at evaluation resolution."""
+    b = gt_struct_to_xyxy(gt)
+    return [[int(t)] + [round(float(v), 1) for v in bb] for t, bb in zip(gt["track_id"], b)]
 
 
 def main():
@@ -181,11 +188,12 @@ def main():
         det, dt = run(data, True); ms["frame"].append(dt); n_eval["frame"] += 1
         rec = {"seq": name, "pair": i, "t0": t0, "model": "frame", "t": t0, "ms": round(dt, 1), "n_gt": len(tr0)}
         for thr in score_thrs:
-            m, fp, nd = match(det, tr0, iou_thr, thr)
+            m, fp, nd, mb = match(det, tr0, iou_thr, thr)
             fp_count[thr]["frame"] += fp; det_count[thr]["frame"] += nd
             for tid in m:
                 first_hit[thr]["frame"].setdefault((name, tid), t0)
-            rec[f"m@{thr}"] = m; rec[f"fp@{thr}"] = fp
+            rec[f"m@{thr}"] = m; rec[f"fp@{thr}"] = fp; rec[f"mb@{thr}"] = mb
+        rec["gt"] = gt_list(tr0)
         fout.write(json.dumps(rec) + "\n")
 
         # event+frame at t0 + d
@@ -197,11 +205,12 @@ def main():
             rec = {"seq": name, "pair": i, "t0": t0, "model": "event", "t": t0 + d, "ms": round(dt, 1),
                    "n_events": int(data.num_nodes), "n_gt": len(gt)}
             for thr in score_thrs:
-                m, fp, nd = match(det, gt, iou_thr, thr)
+                m, fp, nd, mb = match(det, gt, iou_thr, thr)
                 fp_count[thr]["event"] += fp; det_count[thr]["event"] += nd
                 for tid in m:
                     first_hit[thr]["event"].setdefault((name, tid), t0 + d)
-                rec[f"m@{thr}"] = m; rec[f"fp@{thr}"] = fp
+                rec[f"m@{thr}"] = m; rec[f"fp@{thr}"] = fp; rec[f"mb@{thr}"] = mb
+            rec["gt"] = gt_list(gt)
             fout.write(json.dumps(rec) + "\n")
 
         if i % 20 == 0:
@@ -212,6 +221,7 @@ def main():
     fout.close()
 
     summary = {"sequences": seqs, "pairs": n_pairs, "steps_us": steps_us, "iou": iou_thr,
+               "eval_width": int(ds.width), "eval_height": int(ds.height), "strict": STRICT,
                "ms_mean": {k: float(np.mean(v)) for k, v in ms.items()}, "n_eval": n_eval,
                "tracks_total": {"pedestrian": sum(1 for v in first_label.values() if v["cls"] == 1),
                                 "car": sum(1 for v in first_label.values() if v["cls"] == 0)},

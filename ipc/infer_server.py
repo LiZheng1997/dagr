@@ -535,6 +535,7 @@ def serve(socket_path: str, model):
     os.chmod(socket_path, 0o666)
     print(f"[infer_server] listening on {socket_path} (binary protocol v1)", flush=True)
 
+    _stats = {"n": 0, "ev": 0, "ms": 0.0, "ev_min": -1, "zero": 0}
     while True:
         conn, _ = srv.accept()
         print("[infer_server] client connected", flush=True)
@@ -556,6 +557,15 @@ def serve(socket_path: str, model):
                     out = detections_to_numpy(det)
                     elapsed_ms = (time.time() - t0) * 1000
                     reply = encode_infer_reply_ok(req_id, out, elapsed_ms)
+                    # periodic stats: events per request as received (before the per-frame cap)
+                    n_ev = int(len(events["x"])) if isinstance(events, dict) and "x" in events else -1
+                    _stats["n"] += 1; _stats["ev"] += max(n_ev, 0); _stats["ms"] += elapsed_ms
+                    _stats["ev_min"] = n_ev if _stats["ev_min"] < 0 else min(_stats["ev_min"], n_ev)
+                    _stats["zero"] += 1 if n_ev == 0 else 0
+                    if _stats["n"] % 100 == 0:
+                        print(f"[infer_server] stats last100: events/request mean {_stats['ev']/100:.0f} "
+                              f"min {_stats['ev_min']} zero {_stats['zero']}  infer ms mean {_stats['ms']/100:.1f}", flush=True)
+                        _stats.update(n=0, ev=0, ms=0.0, ev_min=-1, zero=0)
                 except Exception as e:
                     traceback.print_exc()
                     reply = encode_infer_reply_err(req_id, f"{type(e).__name__}: {e}",

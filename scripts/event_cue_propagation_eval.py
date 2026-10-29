@@ -24,6 +24,7 @@ SEQS=os.environ.get("EV_SEQS","zurich_city_09_b,zurich_city_09_c,zurich_city_09_
 STEP=int(os.environ.get("EV_STEP_US","5000")); WIN=int(os.environ.get("EV_WIN_US","5000"))
 STEPS=[10000,20000,30000,40000,50000]; THR="0.3"; MINEV=int(os.environ.get("EV_MIN","12"))
 MAXP=int(os.environ.get("EV_MAX_PAIRS","0"))
+NOISE_HZ=float(os.environ.get("EV_NOISE_HZ","0")); RNG=np.random.default_rng(0); TAG=os.environ.get("EV_TAG","")
 CLS={0:"pedestrian",2:"car"}
 args=FLAGS()
 def iou(a,b):
@@ -62,7 +63,7 @@ for seq in SEQS:
     S=json.load(open("/output/lt2_%s_summary.json"%seq)); cls_of={int(r["track"]):r["cls"] for r in S["by_score"][THR]["tracks"]}
     ds=DSEC(__import__("pathlib").Path("/dsec_night/one_"+seq),"test",Augmentations.transform_testing,debug=False,min_bbox_diag=15,min_bbox_height=10,demo=True)
     ds.no_eval=True; ds.set_num_us(STEPS[-1])
-    fo=open("/output/evcue/evcue_%s.jsonl"%seq,"w"); n=0; t_start=time.time()
+    fo=open("/output/evcue/evcue%s_%s.jsonl"%(TAG,seq),"w"); n=0; t_start=time.time()
     pairs=sorted(recs)
     if MAXP: pairs=pairs[:MAXP]
     for i in pairs:
@@ -74,6 +75,10 @@ for seq in SEQS:
         data=ds[i]; t0=int(data.t0); t1=t0+STEPS[-1]
         x=data.pos[:,0].numpy().astype(np.float32); y=data.pos[:,1].numpy().astype(np.float32)
         ta=t1-(1_000_000-data.t.numpy().astype(np.int64))       # absolute event time (us)
+        if NOISE_HZ>0:   # v2e-style shot noise: Poisson, uniform over the native 640x480 array, 4 native px per eval px
+            nn=RNG.poisson(NOISE_HZ*640*480*(t1-t0)*1e-6*(ds.width*ds.height)/(320*240))
+            x=np.concatenate([x,RNG.uniform(0,ds.width,nn).astype(np.float32)]); y=np.concatenate([y,RNG.uniform(0,ds.height,nn).astype(np.float32)])
+            ta=np.concatenate([ta,RNG.integers(t0,t1,nn)])
         o=np.argsort(ta,kind="stable"); x,y,ta=x[o],y[o],ta[o]
         # ---- activity indicator, scored on every step (class-agnostic, whole frame halves)
         for d in STEPS:

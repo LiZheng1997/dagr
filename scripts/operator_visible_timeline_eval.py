@@ -29,6 +29,7 @@ PERIOD_B = int(os.environ.get("PERIOD_B", "2")); AGE_C = int(os.environ.get("AGE
 NET = int(os.environ.get("NET_MS", "135")) * MS; VIDEO = int(os.environ.get("VIDEO_MS", "285")) * MS
 HOR = 250 * MS; STEP = 10 * MS; XWIN = 10 * MS; SEARCH = 6; BLUR = 1.0; MINEV = 12; KEY = 30 * MS; THR = "0.3"
 MAXP = int(os.environ.get("EV_MAX_PAIRS", "0")); TAG = os.environ.get("EV_TAG", "")
+LT2 = os.environ.get("EV_LT2", "lt2")   # input prefix: lt2 (DAGR frame branch) or e.g. lt2y26n (YOLO as the frame detector)
 NOISE_HZ = float(os.environ.get("EV_NOISE_HZ", "0")); RNG = np.random.default_rng(0)
 ARMS = ["video", "frame", "frame+cv", "frame+events", "frame+events+cv", "frame+track", "frame+track+pred", "ours", "ours+pred"]
 args = FLAGS()
@@ -106,11 +107,11 @@ summary = {"params": {k: v for k, v in dict(LAT_A=LAT_A, LAT_B=LAT_B, PERIOD_B=P
 for seq in SEQS:
     t_start = time.time()
     recs = {}; gt_at = {}
-    for l in open("/output/lt2_%s_evals.jsonl" % seq):
+    for l in open("/output/%s_%s_evals.jsonl" % (LT2, seq)):
         r = json.loads(l)
         recs.setdefault(r["pair"], {})[r["model"] if r["model"] == "frame" else r["t"] - r["t0"]] = r
         gt_at[r["t"]] = {g[0]: g[1:] for g in r["gt"]}
-    S_ = json.load(open("/output/lt2_%s_summary.json" % seq))
+    S_ = json.load(open("/output/%s_%s_summary.json" % (LT2, seq)))
     cls_of = {int(r["track"]): r["cls"] for r in S_["by_score"][THR]["tracks"]}
     ds = DSEC(Path(ROOT + "/one_" + seq), "test", Augmentations.transform_testing, debug=False,
               min_bbox_diag=15, min_bbox_height=10, demo=True)
